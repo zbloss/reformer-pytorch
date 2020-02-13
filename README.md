@@ -42,7 +42,8 @@ model = ReformerLM(
     num_mem_kv = 128,       # persistent learned memory key values, from all-attention paper
     twin_attention = False, # both branches of the reversible network will be attention
     use_full_attn = False,  # use full self attention, for comparison
-    full_attn_thres = 1024  # use full attention if context length is less than set value
+    full_attn_thres = 1024, # use full attention if context length is less than set value
+    use_scale_norm = False  # use scale norm from 'Transformers without tears' paper
 ).cuda()
 
 x = torch.randint(0, 20000, (1, 8192)).long().cuda()
@@ -103,7 +104,8 @@ attn = LSHAttention(
 qk = torch.randn(10, 1024, 128)
 v = torch.randn(10, 1024, 128)
 
-attn_out, buckets = attn(qk, v) # (10, 1024, 128)
+out, attn, buckets = attn(qk, v) # (10, 1024, 128)
+# attn contains the unsorted attention weights, provided return_attn is set to True (costly otherwise)
 # buckets will contain the bucket number (post-argmax) of each token of each batch
 ```
 
@@ -187,6 +189,41 @@ enc_keys = encoder(visual_emb)
 yo = decoder(yi, keys = enc_keys) # (1, 4096, 20000)
 ```
 
+## Research
+
+To access the attention weights and bucket distribution, simply wrap the instantiated model with the `Recorder` wrapper class.
+
+```python
+import torch
+from reformer_pytorch import Reformer, Recorder
+
+model = Reformer(
+    dim = 512,
+    depth = 12,
+    max_seq_len = 8192,
+    heads = 8,
+    lsh_dropout = 0.1,
+    causal = True
+).cuda()
+
+model = Recorder(model)
+
+x = torch.randn(1, 8192, 512).cuda()
+y = model(x)
+
+model.recordings[0] # a list of attention weights and buckets for the first forward pass
+
+model.turn_off() # stop recording
+model.turn_on() # start recording
+model.clear() # clear the recordings
+
+model = model.eject() # recover the original model and remove all listeners
+```
+
+## Benchmarks
+
+- <a href="https://github.com/zbloss">Zachary Bloss</a> has kindly added code for training GLUE under `examples/glue`
+
 ## Todo
 
 1. ~~Make it so Reformer can be used as decoder where queries only attend to fed key/values~~
@@ -196,28 +233,37 @@ yo = decoder(yi, keys = enc_keys) # (1, 4096, 20000)
 
 ## Citations
 ```bibtex
-@inproceedings{
-    kitaev2020reformer,
-    title={Reformer: The Efficient Transformer},
-    author={Nikita Kitaev and Lukasz Kaiser and Anselm Levskaya},
-    booktitle={International Conference on Learning Representations},
-    year={2020},
-    url={https://openreview.net/forum?id=rkgNKkHtvB}
+@inproceedings{kitaev2020reformer,
+    title       = {Reformer: The Efficient Transformer},
+    author      = {Nikita Kitaev and Lukasz Kaiser and Anselm Levskaya},
+    booktitle   = {International Conference on Learning Representations},
+    year        = {2020},
+    url         = {https://openreview.net/forum?id=rkgNKkHtvB}
 }
 ```
 
 ```bibtex
 @article{DBLP:journals/corr/abs-1907-01470,
-  author    = {Sainbayar Sukhbaatar and
+    author    = {Sainbayar Sukhbaatar and
                Edouard Grave and
                Guillaume Lample and
                Herv{\'{e}} J{\'{e}}gou and
                Armand Joulin},
-  title     = {Augmenting Self-attention with Persistent Memory},
-  journal   = {CoRR},
-  volume    = {abs/1907.01470},
-  year      = {2019},
-  url       = {http://arxiv.org/abs/1907.01470}
+    title     = {Augmenting Self-attention with Persistent Memory},
+    journal   = {CoRR},
+    volume    = {abs/1907.01470},
+    year      = {2019},
+    url       = {http://arxiv.org/abs/1907.01470}
+}
+```
+
+```bibtex
+@article{1910.05895,
+    author  = {Toan Q. Nguyen and Julian Salazar},
+    title   = {Transformers without Tears: Improving the Normalization of Self-Attention},
+    year    = {2019},
+    eprint  = {arXiv:1910.05895},
+    doi     = {10.5281/zenodo.3525484},
 }
 ```
 

@@ -25,10 +25,10 @@ def batched_index_select(values, indices):
     last_dim = values.shape[-1]
     return values.gather(1, indices[:, :, None].expand(-1, -1, last_dim))
 
-def process_inputs_chunk(fn, *args, chunks=1):
-    chunked_inputs = list(map(lambda x: x.chunk(chunks, dim=0), args))
+def process_inputs_chunk(fn, *args, chunks=1, dim=0):
+    chunked_inputs = list(map(lambda x: x.chunk(chunks, dim=dim), args))
     outputs = [fn(*input_pair) for input_pair in zip(*chunked_inputs)]
-    return outputs
+    return tuple(map(lambda x: torch.cat(x, dim=dim), zip(*outputs)))
 
 def chunked_sum(tensor, chunks=1):
     *orig_size, last_dim = tensor.shape
@@ -48,6 +48,9 @@ def cache_fn(f):
 
 def default(val, default_val):
     return default_val if val is None else val
+
+def max_neg_value(tensor):
+    return -torch.finfo(tensor.dtype).max
 
 # helper classes
 
@@ -121,7 +124,8 @@ class LSHAttention(nn.Module):
                   attend_across_buckets = True,
                   rehash_each_round = True,
                   drop_for_hash_rate = 0.0,
-                  random_rotations_per_head = False):
+                  random_rotations_per_head = False,
+                  return_attn = False):
         super().__init__()
         if dropout >= 1.0:
             raise ValueError('Dropout rates must be lower than 1.')
@@ -141,6 +145,9 @@ class LSHAttention(nn.Module):
         self._attend_across_buckets = attend_across_buckets
         self._rehash_each_round = rehash_each_round
         self._random_rotations_per_head = random_rotations_per_head
+
+        # will expend extra computation to return attention matrix
+        self._return_attn = return_attn
 
     def hash_vectors(self, n_buckets, vecs):
         batch_size = vecs.shape[0]
@@ -188,7 +195,7 @@ class LSHAttention(nn.Module):
 
         return buckets
 
-    def forward(self, qk, v, query_len = None):
+    def forward(self, qk, v, query_len = None, input_mask = None):
         batch_size, seqlen, dim = qk.shape
         query_len = default(query_len, seqlen)
         device = qk.device
@@ -221,7 +228,6 @@ class LSHAttention(nn.Module):
         bq_t = bkv_t = torch.reshape(st, (batch_size, chunk_size, -1))
         bqk = torch.reshape(sqk, (batch_size, chunk_size, -1, dim))
         bv = torch.reshape(sv, (batch_size, chunk_size, -1, dim))
-        bq_buckets = bkv_buckets = torch.reshape(sbuckets_and_t // seqlen, (batch_size, chunk_size, -1))
 
         # Hashing operates on unit-length vectors. Unnormalized query vectors are
         # fine because they effectively provide a learnable temperature for the
@@ -240,15 +246,24 @@ class LSHAttention(nn.Module):
         bk = look_one_back(bk)
         bv = look_one_back(bv)
         bkv_t = look_one_back(bkv_t)
-        bkv_buckets = look_one_back(bkv_buckets)
 
         # Dot-product attention.
         dots = torch.einsum('bhie,bhje->bhij', bq, bk) * (dim ** -0.5)
+        masked_value = max_neg_value(dots)
+
+        # Input mask for padding in variable lengthed sequences
+        if input_mask is not None:
+            input_mask = F.pad(input_mask, (0, seqlen - input_mask.shape[1]), 'constant', True)
+            mq = input_mask.gather(1, st).reshape((batch_size, chunk_size, -1))
+            mkv = look_one_back(mq)
+            mask = mq[:, :, :, None] * mkv[:, :, None, :]
+            dots.masked_fill_(~mask, masked_value)
+            del mask
 
         # Causal masking
         if self.causal:
             mask = bq_t[:, :, :, None] < bkv_t[:, :, None, :].clamp(max=query_len - 1)
-            dots.masked_fill_(mask, float('-inf'))
+            dots.masked_fill_(mask, masked_value)
             del mask
 
         # Mask out attention to self except when no other targets are available.
@@ -258,8 +273,10 @@ class LSHAttention(nn.Module):
 
         # Mask out attention to other hash buckets.
         if not self._attend_across_buckets:
+            bq_buckets = bkv_buckets = torch.reshape(sbuckets_and_t // seqlen, (batch_size, chunk_size, -1))
+            bkv_buckets = look_one_back(bkv_buckets)
             bucket_mask = bq_buckets[:, :, :, None] != bkv_buckets[:, :, None, :]
-            dots.masked_fill_(bucket_mask, float('-inf'))
+            dots.masked_fill_(bucket_mask, masked_value)
             del bucket_mask
 
         # Don't double-count query-key pairs across multiple rounds of hashing.
@@ -298,9 +315,9 @@ class LSHAttention(nn.Module):
         # Softmax.
         dots_logsumexp = torch.logsumexp(dots, dim=-1, keepdim=True)
         dots = torch.exp(dots - dots_logsumexp).type(dots.type())
-        dots = self.dropout(dots)
+        dropped_dots = self.dropout(dots)
 
-        bo = torch.einsum('buij,buje->buie', dots, bv)
+        bo = torch.einsum('buij,buje->buie', dropped_dots, bv)
         so = torch.reshape(bo, (batch_size, -1, dim))
         slogits = torch.reshape(dots_logsumexp, (batch_size, -1,))
 
@@ -327,13 +344,23 @@ class LSHAttention(nn.Module):
             query_slice = (slice(None), slice(None), slice(0, query_len))
             o, logits = o[query_slice], logits[query_slice]
 
-        if self.n_hashes == 1:
-            out = o.squeeze(1)
-        else:
-            probs = torch.exp(logits - torch.logsumexp(logits, dim=1, keepdim=True))
-            out = torch.sum(o * probs, dim=1)
+        probs = torch.exp(logits - torch.logsumexp(logits, dim=1, keepdim=True))
+        out = torch.sum(o * probs, dim=1)
 
-        return out, buckets
+        attn = torch.empty(0, device=device)
+
+        # return unsorted attention weights
+        if self._return_attn:
+            attn_unsort = ((bq_t * seqlen)[:, :, :, None] + bkv_t[:, :, None, :])
+            attn_unsort = attn_unsort.view(batch_size * self.n_hashes, -1).long()
+            unsorted_dots = torch.zeros(batch_size * self.n_hashes, seqlen * seqlen, device=device)
+            unsorted_dots.scatter_add_(1, attn_unsort, dots.view_as(attn_unsort))
+            del attn_unsort
+            unsorted_dots = unsorted_dots.reshape(batch_size, self.n_hashes, seqlen, seqlen)
+            attn = torch.sum(unsorted_dots[:, :, 0:query_len, :] * probs, dim=1)
+
+        # return output, attention matrix, and bucket distribution
+        return out, attn, buckets
 
 # simple full attention
 
@@ -342,31 +369,40 @@ class FullQKAttention(nn.Module):
         super().__init__()
         self.causal = causal
 
-    def forward(self, qk, v, query_len = None):
-        query_len = default(query_len, qk.shape[1])
+    def forward(self, qk, v, query_len = None, input_mask = None):
+        b, seq_len, dim = qk.shape
+        query_len = default(query_len, seq_len)
         t = query_len
 
         q = qk[:, 0:query_len]
         qk = F.normalize(qk, 2, dim=-1).type(q.type())
 
-        dot = torch.einsum('bie,bje->bij', q, qk)
+        dot = torch.einsum('bie,bje->bij', q, qk) * (dim ** -0.5)
 
         # qk attention requires tokens not attend to self
         i = torch.arange(t)
         dot[:, i, i] = TOKEN_SELF_ATTN_VALUE
+        masked_value = max_neg_value(dot)
+
+        # Input mask for padding in variable lengthed sequences
+        if input_mask is not None:
+            mask = input_mask[:, :, None] * input_mask[:, None, :]
+            mask = F.pad(mask, (0, seq_len - mask.shape[-1]), 'constant', True)
+            dot.masked_fill_(~mask, masked_value)
 
         if self.causal:
             i, j = torch.triu_indices(t, t, 1)
-            dot[:, i, j] = float('-inf')
+            dot[:, i, j] = masked_value
 
         dot = dot.softmax(dim=-1)
         out = torch.einsum('bij,bje->bie', dot, v)
-        return out, dot
+
+        return out, dot, torch.empty(0)
 
 # Shared qk attention, using either full or LSH attention
 
 class LSHSelfAttention(nn.Module):
-    def __init__(self, dim, heads = 8, bucket_size = 64, n_hashes = 8, causal = False, attn_chunks = None, random_rotations_per_head = False, attend_across_buckets = True, allow_duplicate_attention = True, num_mem_kv = 0, use_full_attn = False, full_attn_thres = 0, **kwargs):
+    def __init__(self, dim, heads = 8, bucket_size = 64, n_hashes = 8, causal = False, attn_chunks = None, random_rotations_per_head = False, attend_across_buckets = True, allow_duplicate_attention = True, num_mem_kv = 0, use_full_attn = False, full_attn_thres = None, return_attn = False, **kwargs):
         super().__init__()
         assert dim % heads == 0, 'dimensions must be divisible by number of heads'
 
@@ -379,16 +415,18 @@ class LSHSelfAttention(nn.Module):
         self.to_out = nn.Linear(dim, dim)
 
         self.bucket_size = bucket_size
-        self.lsh_attn = LSHAttention(bucket_size=bucket_size, n_hashes=n_hashes, causal=causal, random_rotations_per_head=random_rotations_per_head, attend_across_buckets = attend_across_buckets,  allow_duplicate_attention = allow_duplicate_attention, **kwargs)
+        self.lsh_attn = LSHAttention(bucket_size=bucket_size, n_hashes=n_hashes, causal=causal, random_rotations_per_head=random_rotations_per_head, attend_across_buckets = attend_across_buckets,  allow_duplicate_attention = allow_duplicate_attention, return_attn = return_attn, **kwargs)
         self.full_attn = FullQKAttention(causal = causal)
 
         self.use_full_attn = use_full_attn
-        self.full_attn_thres = full_attn_thres
+        self.full_attn_thres = default(full_attn_thres, bucket_size)
 
         self.num_mem_kv = num_mem_kv
         self.mem_kv = nn.Parameter(torch.randn(1, num_mem_kv, dim, requires_grad=True))
 
-    def forward(self, x, keys = None):
+        self.callback = None
+
+    def forward(self, x, keys = None, input_mask = None):
         device = x.device
         b, t, e, h, m = *x.shape, self.heads, self.num_mem_kv
 
@@ -396,8 +434,10 @@ class LSHSelfAttention(nn.Module):
         keys = default(keys, torch.empty(b, 0, e, dtype=mem.dtype, device=device))
 
         kv_len = t + m + keys.shape[1]
-        use_lsh = not self.use_full_attn or kv_len < self.full_attn_thres
-        assert not use_lsh or (kv_len % self.bucket_size == 0), f'Sequence length needs to be divisible by target bucket size - {self.bucket_size}'
+        use_full_attn = self.use_full_attn or kv_len <= self.full_attn_thres
+
+        if not use_full_attn:
+            assert not use_full_attn and (kv_len % self.bucket_size == 0), f'Sequence length needs to be divisible by target bucket size - {self.bucket_size}'
 
         x = torch.cat((x, mem, keys), dim=1)
         qk = self.toqk(x)
@@ -412,15 +452,17 @@ class LSHSelfAttention(nn.Module):
         qk = merge_heads(qk)
         v = merge_heads(v)
 
-        attn_fn = self.lsh_attn if use_lsh else self.full_attn
-        partial_attn_fn = partial(attn_fn, query_len = t)
-        outputs = process_inputs_chunk(partial_attn_fn, qk, v, chunks=self.attn_chunks)
-        attn_out = torch.cat([output for (output, _) in outputs], dim=0)
+        attn_fn = self.lsh_attn if not use_full_attn else self.full_attn
+        partial_attn_fn = partial(attn_fn, query_len = t, input_mask = input_mask)
+        out, attn, buckets = process_inputs_chunk(partial_attn_fn, qk, v, chunks=self.attn_chunks)
+        out = split_heads(out).view(b, t, e)
 
-        out = split_heads(attn_out).view(b, t, e)
+        if self.callback is not None:
+            self.callback(attn.reshape(b, h, t, -1), buckets.reshape(b, h, -1))
+
         return self.to_out(out)
 
-# feedforward
+# feed forward
 
 class GELU(nn.Module):
     def forward(self, x):
@@ -440,7 +482,7 @@ class FeedForward(nn.Module):
 # reformer lm
 
 class Reformer(nn.Module):
-    def __init__(self, dim, depth, max_seq_len, heads = 8, bucket_size = 64, n_hashes = 8, ff_chunks = 100, attn_chunks = None, causal = False, weight_tie = False, lsh_dropout = 0., lsh_attend_across_buckets = True, lsh_allow_duplicate_attention = True, random_rotations_per_head = False, twin_attention = False, use_scale_norm = False, use_full_attn = False, full_attn_thres = 0, num_mem_kv = 0):
+    def __init__(self, dim, depth, max_seq_len, heads = 8, bucket_size = 64, n_hashes = 8, ff_chunks = 100, attn_chunks = None, causal = False, weight_tie = False, lsh_dropout = 0., lsh_attend_across_buckets = True, lsh_allow_duplicate_attention = True, random_rotations_per_head = False, twin_attention = False, use_scale_norm = False, use_full_attn = False, full_attn_thres = None, num_mem_kv = 0):
         super().__init__()
         self.dim = dim
         self.depth = depth
@@ -468,21 +510,21 @@ class Reformer(nn.Module):
             blocks.append(ReversibleBlock(f, g, split_along_dim=-1, fix_random_seed=True))
 
         self.layers = ReversibleSequence(nn.ModuleList(blocks), eagerly_discard_variables = False)
-        self.modules = list(chain(*[[m.f_block.fn, m.g_block.fn] for m in blocks]))
+        self.layer_modules = list(chain(*[[m.f_block.fn, m.g_block.fn] for m in blocks]))
 
     def set_reversible_args(self, *args, **kwargs):
-        for module in self.modules:
+        for module in self.layer_modules:
             if isinstance(module, SettableArgs):
                 module.set_args(*args, **kwargs)
 
-    def forward(self, x, keys = None):
+    def forward(self, x, **kwargs):
         x = torch.cat([x, x], dim = -1)
-        self.set_reversible_args(keys = keys)
+        self.set_reversible_args(**kwargs)
         x = self.layers(x)
         return torch.stack(x.chunk(2, dim=-1)).sum(dim=0)
 
 class ReformerLM(nn.Module):
-    def __init__(self, num_tokens, dim, depth, max_seq_len, heads = 8, bucket_size = 64, n_hashes = 8, ff_chunks = 100, attn_chunks = None, causal = False, weight_tie = False, lsh_dropout = 0., random_rotations_per_head = False, twin_attention = False, use_scale_norm = False, use_full_attn = False, full_attn_thres = 0, num_mem_kv = 0, emb_dim = None, return_embeddings = False, fixed_position_emb = False):
+    def __init__(self, num_tokens, dim, depth, max_seq_len, heads = 8, bucket_size = 64, n_hashes = 8, ff_chunks = 100, attn_chunks = None, causal = False, weight_tie = False, lsh_dropout = 0., random_rotations_per_head = False, twin_attention = False, use_scale_norm = False, use_full_attn = False, full_attn_thres = None, num_mem_kv = 0, emb_dim = None, return_embeddings = False, fixed_position_emb = False):
         super().__init__()
         emb_dim = default(emb_dim, dim)
         self.token_emb = nn.Embedding(num_tokens, emb_dim)
