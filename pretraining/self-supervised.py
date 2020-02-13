@@ -13,6 +13,7 @@ import os
 import json
 import logging
 from datetime import datetime
+import deepspeed
 
 
 class WikiDataset(Dataset):
@@ -61,7 +62,8 @@ class ReformerTrainer(object):
                  eval_batch_size=None,
                  tb_writer=True,
                  tb_dir='./tb_logs',
-                 log_dir='./logs'):
+                 log_dir='./logs',
+                 deepspeed_config=None):
         """
         Provides an easy to use class for pretraining and evaluating a Reformer Model.
 
@@ -72,6 +74,7 @@ class ReformerTrainer(object):
         :param tb_writer: (bool) Whether to write to tensorboard or not.
         :param tb_dir: (str) Where to write TB logs to.
         :param log_dir: (str) Where to write generic logs to.
+        :param deepspeed_config: (dict) deepspeed configuration.
         """
 
         self.dataset = dataset
@@ -96,6 +99,8 @@ class ReformerTrainer(object):
         if tb_writer:
             from torch.utils.tensorboard import SummaryWriter
             self.writer = SummaryWriter(log_dir=tb_dir)
+
+        self.deepspeed_config = deepspeed_config
 
         logging.basicConfig(filename=f'{log_dir}/{datetime.now().date()}.log', level=logging.INFO)
 
@@ -199,6 +204,11 @@ class ReformerTrainer(object):
         global_steps = 0
         local_steps = 0
         step_loss = 0.0
+
+        if self.deepspeed_config is not None:
+            model_engine, optimizer, _, _ = deepspeed.initialize(args=deepspeed_config,
+                                                                 model=model,
+                                                                 model_parameters=model.parameters())
 
         if ckpt_dir is not None:
             assert os.path.isdir(ckpt_dir)
@@ -336,7 +346,7 @@ class ReformerTrainer(object):
 
 
 if __name__ == '__main__':
-    dataset = WikiDataset(path='D:/data/enwiki')
+    dataset = WikiDataset(path='./data/enwiki')
     tokenizer = BertTokenizer.from_pretrained('bert-base-cased')
     tokenizer.max_len = 128
     model = ReformerLM(
@@ -347,7 +357,39 @@ if __name__ == '__main__':
         max_seq_len=tokenizer.max_len,
         causal=True
     )
-    trainer = ReformerTrainer(dataset, model, tokenizer, train_batch_size=32, eval_batch_size=32)
+
+    dsc = deepspeed_config = {
+            "train_batch_size": 8,
+            "gradient_accumulation_steps": 1,
+            "steps_per_print": 1,
+            "zero_optimization": True,
+            "disable_allgather": True,
+            "optimizer": {
+            "type": "Adam",
+            "params": {
+              "lr": 0.00015,
+              "max_grad_norm": 1.0
+                }
+            },
+
+            "fp16": {
+                "enabled": True,
+                "loss_scale": 0,
+                "loss_scale_window": 1000,
+                "hysteresis": 2,
+                "min_loss_scale": 1
+            }
+        }
+
+    trainer = ReformerTrainer(
+        dataset,
+        model,
+        tokenizer,
+        train_batch_size=32,
+        eval_batch_size=32,
+        deepspeed_config=dsc,
+        tb_writer=False
+    )
     train_dataloader, eval_dataloader = trainer.build_dataloaders(train_test_split=0.90)
     model = trainer.train(epochs=3,
                           train_dataloader=train_dataloader,
