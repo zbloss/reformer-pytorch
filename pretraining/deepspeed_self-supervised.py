@@ -1,3 +1,6 @@
+import argparse
+import deepspeed
+
 import re
 import torch
 import torch.nn as nn
@@ -6,7 +9,7 @@ from torch.utils.data import Dataset, DataLoader, random_split
 
 from tqdm import tqdm
 
-from reformer_pytorch import Reformer, ReformerLM
+from reformer_pytorch import ReformerLM
 from transformers import BertTokenizer, PreTrainedTokenizer
 from fairseq.optim.adafactor import Adafactor
 import os
@@ -99,79 +102,34 @@ class ReformerTrainer(object):
 
         logging.basicConfig(filename=f'{log_dir}/{datetime.now().date()}.log', level=logging.INFO)
 
-    def build_dataloaders(self, train_test_split=0.1, train_shuffle=True, eval_shuffle=True):
+    def split_datasets(self, train_test_split=0.1):
         """
-        Builds the Training and Eval DataLoaders
-
-        :param train_test_split: The ratio split of test to train data.
-        :param train_shuffle: (bool) True if you wish to shuffle the train_dataset.
-        :param eval_shuffle: (bool) True if you wish to shuffle the eval_dataset.
-        :return: train dataloader and evaluation dataloader.
+        Splits self.dataset into a train and test dataset.
+        :param train_test_split: ratio of test to train data.
+        :return: 2 torch.utils.data.Dataset
         """
         dataset_len = len(self.dataset)
         eval_len = int(dataset_len * train_test_split)
         train_len = dataset_len - eval_len
         train_dataset, eval_dataset = random_split(self.dataset, (train_len, eval_len))
+        return train_dataset, eval_dataset
+
+    def build_dataloaders(self, train_dataset, eval_dataset, train_shuffle=True, eval_shuffle=True):
+        """
+        Builds the Training and Eval DataLoaders
+
+        :param train_dataset: torch.utils.data.Dataset of Training Data.
+        :param eval_dataset: torch.utils.data.Dataset of Evaluation Data.
+        :param train_shuffle: (bool) True if you wish to shuffle the train_dataset.
+        :param eval_shuffle: (bool) True if you wish to shuffle the eval_dataset.
+        :return: train dataloader and evaluation dataloader.
+        """
+
         train_loader = DataLoader(train_dataset, batch_size=self.train_batch_size, shuffle=train_shuffle)
         eval_loader = DataLoader(eval_dataset, batch_size=self.eval_batch_size, shuffle=eval_shuffle)
         logging.info(f'''train_dataloader size: {len(train_loader.dataset)} | shuffle: {train_shuffle}
                          eval_dataloader size: {len(eval_loader.dataset)} | shuffle: {eval_shuffle}''')
         return train_loader, eval_loader
-
-    def mask_tokens(self, inputs: torch.Tensor, mlm_probability=0.15, pad=True):
-        """ Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original. """
-        labels = inputs.clone()
-        # mlm_probability defaults to 0.15 in Bert
-        probability_matrix = torch.full(labels.shape, mlm_probability)
-        special_tokens_mask = [
-            self.tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True) for val in labels.tolist()
-        ]
-        probability_matrix.masked_fill_(torch.tensor(special_tokens_mask, dtype=torch.bool), value=0.0)
-        if self.tokenizer._pad_token is not None:
-            padding_mask = labels.eq(self.tokenizer.pad_token_id)
-            probability_matrix.masked_fill_(padding_mask, value=0.0)
-        masked_indices = torch.bernoulli(probability_matrix).bool()
-        labels[~masked_indices] = -100  # We only compute loss on masked tokens
-
-        # 80% of the time, we replace masked input tokens with tokenizer.mask_token ([MASK])
-        indices_replaced = torch.bernoulli(torch.full(labels.shape, 0.8)).bool() & masked_indices
-        inputs[indices_replaced] = self.tokenizer.convert_tokens_to_ids(self.tokenizer.mask_token)
-
-        # 10% of the time, we replace masked input tokens with random word
-        indices_random = torch.bernoulli(torch.full(labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
-        random_words = torch.randint(len(self.tokenizer), labels.shape, dtype=torch.long)
-        inputs[indices_random] = random_words[indices_random]
-
-        if pad:
-            input_pads = self.tokenizer.max_len - inputs.shape[-1]
-            label_pads = self.tokenizer.max_len - labels.shape[-1]
-
-            inputs = F.pad(inputs, pad=(0, input_pads), value=self.tokenizer.pad_token_id)
-            labels = F.pad(labels, pad=(0, label_pads), value=self.tokenizer.pad_token_id)
-
-        # The rest of the time (10% of the time) we keep the masked input tokens unchanged
-        return inputs, labels
-
-    def _tokenize_input_ids(self, input_ids: list, pad_to_max_length: bool = True):
-        """
-        Helper function to clean up the train and eval functions
-        :param input_ids: inputs to tokenize.
-        :param pad_to_max_length: Whether you want to pad the inputs to the tokenizer.max_len
-        :return: Tensor containing training data.
-        """
-        inputs = torch.cat(
-            [
-                self.tokenizer.encode(
-                    input_ids[i],
-                    add_special_tokens=True,
-                    max_length=self.tokenizer.max_len,
-                    pad_to_max_length=pad_to_max_length,
-                    return_tensors='pt'
-                ) \
-                for i in range(len(input_ids))
-            ]
-        )
-        return inputs
 
     def train(self,
               epochs,
@@ -348,20 +306,252 @@ if __name__ == '__main__':
         causal=True
     )
 
+    parameters = filter(lambda p: p.requires_grad, model.parameters())
+
+    parser = argparse.ArgumentParser(description='Reformer')
+
+    # data
+    # cuda
+    parser.add_argument('--with_cuda', default=False, action='store_true', dest='with_cuda',
+                        help='use CPU in case there\'s no GPU support')
+    parser.add_argument('--use_ema', default=False, action='store_true', dest='use_ema',
+                        help='whether use exponential moving average')
+
+    # train
+    parser.add_argument('-b', '--batch_size', default=32, type=int, dest='batch_size',
+                        help='mini-batch size (default: 32)')
+    parser.add_argument('-e', '--epochs', default=3, type=int, dest='epochs',
+                        help='number of total epochs (default: 3)')
+    parser.add_argument('--local_rank', type=int, default=-1, dest='local_rank',
+                        help='local rank passed from distributed launcher')
+    parser.add_argument('--tb_writer', default=False, action='store_true', dest='tb_writer',
+                        help='Whether to write tensorboard logs or not')
+    parser.add_argument('--ckpt_dir', default='./ckpt_dir', type=str, dest='ckpt_dir',
+                        help='directory to save and load checkpoints to')
+    parser.add_argument('--log_dir', default='./ckpt_dir', type=str, dest='ckpt_dir',
+                        help='directory to save and load checkpoints to')
+    parser.add_argument('--ckpt_id', type=int, dest='ckpt_id',
+                        help='The ckpt you wish to continue from.')
+
+    # Include DeepSpeed configuration arguments
+    parser = deepspeed.add_config_arguments(parser)
+
+    args = parser.parse_args()
+
+    if args.with_cuda:
+        assert torch.cuda.is_available()
+
     trainer = ReformerTrainer(
         dataset,
         model,
         tokenizer,
-        train_batch_size=32,
-        eval_batch_size=32,
+        train_batch_size=args.batch_size,
+        eval_batch_size=args.batch_size,
         tb_writer=False
     )
-    train_dataloader, eval_dataloader = trainer.build_dataloaders(train_test_split=0.90)
-    model = trainer.train(epochs=3,
-                          train_dataloader=train_dataloader,
-                          eval_dataloader=eval_dataloader,
-                          log_steps=10,
-                          ckpt_steps=100,
-                          ckpt_dir='./ckpts',
-                          gradient_accumulation_steps=1)
-    torch.save(model, './ckpts/model.bin')
+    train_dataset, eval_dataset = trainer.split_datasets(train_test_split=0.1)
+    train_dataloader, eval_dataloader = trainer.build_dataloaders(train_dataset, eval_dataset)
+
+    model_engine, optimizer, trainloader, __ = deepspeed.initialize(
+        args=args,
+        model=model,
+        model_parameters=parameters,
+        training_data=train_dataset
+    )
+
+
+    def mask_tokens(tokenizer, inputs: torch.Tensor, mlm_probability=0.15, pad=True):
+        """ Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original. """
+        labels = inputs.clone()
+        # mlm_probability defaults to 0.15 in Bert
+        probability_matrix = torch.full(labels.shape, mlm_probability)
+        special_tokens_mask = [
+            tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True) for val in labels.tolist()
+        ]
+        probability_matrix.masked_fill_(torch.tensor(special_tokens_mask, dtype=torch.bool), value=0.0)
+        if tokenizer._pad_token is not None:
+            padding_mask = labels.eq(self.tokenizer.pad_token_id)
+            probability_matrix.masked_fill_(padding_mask, value=0.0)
+        masked_indices = torch.bernoulli(probability_matrix).bool()
+        labels[~masked_indices] = -100  # We only compute loss on masked tokens
+
+        # 80% of the time, we replace masked input tokens with tokenizer.mask_token ([MASK])
+        indices_replaced = torch.bernoulli(torch.full(labels.shape, 0.8)).bool() & masked_indices
+        inputs[indices_replaced] = tokenizer.convert_tokens_to_ids(self.tokenizer.mask_token)
+
+        # 10% of the time, we replace masked input tokens with random word
+        indices_random = torch.bernoulli(torch.full(labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
+        random_words = torch.randint(len(tokenizer), labels.shape, dtype=torch.long)
+        inputs[indices_random] = random_words[indices_random]
+
+        if pad:
+            input_pads = tokenizer.max_len - inputs.shape[-1]
+            label_pads = tokenizer.max_len - labels.shape[-1]
+
+            inputs = F.pad(inputs, pad=(0, input_pads), value=tokenizer.pad_token_id)
+            labels = F.pad(labels, pad=(0, label_pads), value=tokenizer.pad_token_id)
+
+        # The rest of the time (10% of the time) we keep the masked input tokens unchanged
+        return inputs, labels
+
+
+    def _tokenize_input_ids(tokenizer, input_ids: list, pad_to_max_length: bool = True):
+        """
+        Helper function to clean up the train and eval functions
+        :param input_ids: inputs to tokenize.
+        :param pad_to_max_length: Whether you want to pad the inputs to the tokenizer.max_len
+        :return: Tensor containing training data.
+        """
+        inputs = torch.cat(
+            [
+                tokenizer.encode(
+                    input_ids[i],
+                    add_special_tokens=True,
+                    max_length=tokenizer.max_len,
+                    pad_to_max_length=pad_to_max_length,
+                    return_tensors='pt'
+                ) \
+                for i in range(len(input_ids))
+            ]
+        )
+        return inputs
+
+
+    def train(args,
+              model,
+              optimizer,
+              tokenizer,
+              train_dataloader,
+              log_steps,
+              ckpt_steps,
+              gradient_accumulation_steps=1):
+        """
+        Trains the Reformer Model
+        :param args: deepspeed args.
+        :param model: Deepspeed enabled model_engine.
+        :param optimizer: Deepspeed enabled optimizer.
+        :param tokenizer: BertTokenizer to tokenize textual inputs.
+        :param train_dataloader: (torch.utils.data.DataLoader) The data to train on.
+        :param log_steps: The number of steps to iterate before logging.
+        :param ckpt_steps: The number of steps to iterate before checkpointing.
+        :param gradient_accumulation_steps: Optional gradient accumulation.
+        :return: Total number of steps, total loss, model.
+        """
+
+        loss_fn = nn.CrossEntropyLoss()
+        losses = {}
+        global_steps = 0
+        local_steps = 0
+        step_loss = 0.0
+
+        if args.ckpt_dir is not None and args.ckpt_id is not None:
+            assert os.path.isdir(args.ckpt_dir)
+            assert os.path.isfile(f'{args.ckpt_dir}/{args.ckpt_id}')
+            try:
+                logging.info(f'{datetime.now()} | Continuing from checkpoint...')
+                _, client_sd = model_engine.load_checkpoint(args.ckpt_dir, args.ckpt_id)
+
+            except Exception as e:
+                logging.info(f'{datetime.now()} | No checkpoint was found | {e}')
+
+        logging.info(f'''{datetime.now()}
+batch_size: {args.batch_size}
+epochs: {args.epochs}
+log_steps: {log_steps}
+ckpt_steps: {ckpt_steps}
+gradient_accumulation_steps: {gradient_accumulation_steps}
+''')
+
+        for epoch in tqdm(range(args.epochs), desc='Epochs', position=0):
+            logging.info(f'{datetime.now()} | Epoch: {epoch}')
+            for step, batch in tqdm(enumerate(train_dataloader),
+                                    desc='Epoch Iterator',
+                                    position=1,
+                                    leave=True,
+                                    total=len(train_dataloader)):
+                for data in batch:
+                    inputs = _tokenize_input_ids(tokenizer, data, pad_to_max_length=True)
+                    inputs, labels = mask_tokens(tokenizer, inputs)
+                    inputs, labels = inputs.to(model.local_rank), labels.to(model.local_rank)
+
+                    output = model(inputs)
+
+                    # only calculating loss on masked tokens
+                    loss_mx = labels != -100
+                    output = output[loss_mx].view(-1, tokenizer.vocab_size)
+                    labels = labels[loss_mx].view(-1)
+
+                    loss = loss_fn(output, labels)
+
+                    if gradient_accumulation_steps > 1:
+                        loss /= gradient_accumulation_steps
+
+                    step_loss += loss.item()
+                    losses[global_steps] = loss.item()
+                    local_steps += 1
+                    global_steps += 1
+
+                    model.backward(loss)
+                    model.step()
+                    # gradient zero-ing is implemented automatically by deepspeed
+
+                    if global_steps % log_steps == 0:
+                        logging.info(
+                            f'''{datetime.now()} | Train Loss: {step_loss / local_steps} | Steps: {global_steps}''')
+
+                        with open(f'{args.log_dir}/train_results.json', 'w') as results_file:
+                            json.dump(losses, results_file)
+                            results_file.close()
+                        step_loss = 0.0
+                        local_steps = 0
+
+                    if global_steps % ckpt_steps == 0:
+                        ckpt_id = loss.item()
+                        model.save_checkpoint(args.ckpt_dir, ckpt_id)
+                        # evaluating before every checkpoint
+                        evaluate(model, eval_dataloader)
+                        logging.info(f'{datetime.now()} | Saved checkpoint to: {args.ckpt_dir}')
+        logging.info(f'{datetime.now()} | Finished Training | model_type: {type(model)}')
+        torch.save(model, f'{args.ckpt_dir}/model.bin')
+        return model
+
+
+    def evaluate(model, dataloader):
+        """
+        Runs through the provided dataloader with torch.no_grad()
+        :param model: Deepspeed model
+        :param dataloader: (torch.utils.data.DataLoader) Evaluation DataLoader
+        :return: None
+        """
+        loss_fn = nn.CrossEntropyLoss()
+
+        eval_loss = 0.0
+        perplexity = 0.0
+        eval_steps = 0
+
+        logging.info(f'{datetime.now()} | Evaluating...')
+        for step, batch in tqdm(enumerate(dataloader), desc='Evaluating', leave=True, total=len(dataloader)):
+            for data in batch:
+                inputs = _tokenize_input_ids(tokenizer, data, pad_to_max_length=True)
+                inputs, labels = mask_tokens(tokenizer, inputs)
+                inputs, labels = inputs.to(model.local_rank), labels.to(model.local_rank)
+
+                with torch.no_grad():
+                    output = model(inputs)
+
+                loss_mx = labels != -100
+                output_ids = output[loss_mx].view(-1, tokenizer.vocab_size)
+                labels = labels[loss_mx].view(-1)
+                tmp_eval_loss = loss_fn(output_ids, labels)
+                tmp_perplexity = torch.exp(tmp_eval_loss)
+
+                eval_loss += tmp_eval_loss.item()
+                perplexity += tmp_perplexity.item()
+                eval_steps += 1
+
+            eval_loss /= eval_steps
+            perplexity /= eval_steps
+
+            logging.info(f'{datetime.now()} | Step: {step} | Eval Loss: {eval_loss} | Perplexity: {perplexity}')
+
+        return None
